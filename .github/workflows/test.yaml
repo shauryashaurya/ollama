@@ -1,11 +1,20 @@
 name: test
 
+concurrency:
+  # For PRs, later CI runs preempt previous ones. e.g. a force push on a PR
+  # cancels running CI jobs and starts all new ones.
+  #
+  # For non-PR pushes, concurrency.group needs to be unique for every distinct
+  # CI run we want to have happen. Use run_id, which in practice means all
+  # non-PR CI runs will be allowed to run without preempting each other.
+  group: ${{ github.workflow }}-$${{ github.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     paths:
       - '**/*'
       - '!docs/**'
-      - '!examples/**'
       - '!README.md'
 
 jobs:
@@ -22,7 +31,9 @@ jobs:
       - id: changes
         run: |
           changed() {
-            git diff-tree -r --no-commit-id --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} \
+            git diff-tree -r --no-commit-id --name-only \
+              $(git merge-base ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}) \
+              ${{ github.event.pull_request.head.sha }} \
               | xargs python3 -c "import sys; print(any([x.startswith('$1') for x in sys.argv[1:]]))"
           }
 
@@ -51,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
       - run: go get ./...
       - run: |
@@ -64,10 +75,10 @@ jobs:
           echo $env:PATH
           go generate -x ./...
         if: ${{ startsWith(matrix.os, 'windows-') }}
-        name: "Windows Go Generate"
+        name: 'Windows Go Generate'
       - run: go generate -x ./...
         if: ${{ ! startsWith(matrix.os, 'windows-') }}
-        name: "Unix Go Generate"
+        name: 'Unix Go Generate'
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}-libraries
@@ -93,7 +104,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
       - run: go get ./...
       - run: |
@@ -104,7 +115,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-${{ matrix.cuda-version }}-libraries
-          path: llm/build/**/bin/*
+          path: |
+            llm/build/**/bin/*
+            dist/windows-amd64/**
   generate-rocm:
     needs: [changes]
     if: ${{ needs.changes.outputs.GENERATE_ROCM == 'True' }}
@@ -124,7 +137,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
       - run: go get ./...
       - run: |
@@ -135,7 +148,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rocm-${{ matrix.rocm-version }}-libraries
-          path: llm/build/**/lib/*
+          path: |
+            llm/build/**/bin/*
+            dist/windows-amd64/**
 
   # ROCm generation step
   generate-windows-rocm:
@@ -146,9 +161,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
-      - name: "Install ROCm"
+      - name: 'Install ROCm'
         run: |
           $ErrorActionPreference = "Stop"
           write-host "downloading AMD HIP Installer"
@@ -156,7 +171,7 @@ jobs:
           write-host "Installing AMD HIP"
           Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -Wait
           write-host "Completed AMD HIP"
-      - name: "Verify ROCm"
+      - name: 'Verify ROCm'
         run: |
           & 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' --version
       - run: go get ./...
@@ -183,9 +198,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
-      - name: "Install CUDA"
+      - name: 'Install CUDA'
         run: |
           $ErrorActionPreference = "Stop"
           write-host "downloading CUDA Installer"
@@ -199,7 +214,7 @@ jobs:
           echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
           echo "CUDA_PATH_V${cudaVer}=$cudaPath" >> $env:GITHUB_ENV
           echo "CUDA_PATH_VX_Y=CUDA_PATH_V${cudaVer}" >> $env:GITHUB_ENV
-      - name: "Verify CUDA"
+      - name: 'Verify CUDA'
         run: nvcc -V
       - run: go get ./...
       - name: go generate
@@ -215,7 +230,6 @@ jobs:
         env:
           OLLAMA_SKIP_CPU_GENERATE: '1'
       # TODO - do we need any artifacts?
-
 
   lint:
     strategy:
@@ -239,7 +253,7 @@ jobs:
           submodules: recursive
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: false
       - run: |
           case ${{ matrix.arch }} in
@@ -248,21 +262,16 @@ jobs:
           esac >>$GITHUB_ENV
         shell: bash
       - run: |
-          mkdir -p llm/build/linux/$ARCH/stub/bin/
-          touch llm/build/linux/$ARCH/stub/bin/stub.so
+          mkdir -p llm/build/linux/$ARCH/stub/bin
+          touch llm/build/linux/$ARCH/stub/bin/ollama_llama_server
         if: ${{ startsWith(matrix.os, 'ubuntu-') }}
       - run: |
-          mkdir -p llm/build/darwin/$ARCH/stub/bin/
-          touch llm/build/darwin/$ARCH/stub/bin/stub.dylib
-          touch llm/ggml-metal.metal
+          mkdir -p llm/build/darwin/$ARCH/stub/bin
+          touch llm/build/darwin/$ARCH/stub/bin/ollama_llama_server
         if: ${{ startsWith(matrix.os, 'macos-') }}
-      - run: |
-          mkdir -p llm/build/windows/$ARCH/stub/stub/bin/
-          touch llm/build/windows/$ARCH/stub/stub/bin/stub.dll
-        if: ${{ startsWith(matrix.os, 'windows-') }}
       - uses: golangci/golangci-lint-action@v4
         with:
-          args: --timeout 8m0s
+          args: --timeout 8m0s -v
   test:
     strategy:
       matrix:
@@ -277,16 +286,15 @@ jobs:
     env:
       GOARCH: ${{ matrix.arch }}
       CGO_ENABLED: '1'
-      OLLAMA_CPU_TARGET: "static"
+      OLLAMA_CPU_TARGET: 'static'
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
-      - run: go get
       - run: |
           case ${{ matrix.arch }} in
             amd64) echo ARCH=x86_64 ;;
@@ -294,18 +302,14 @@ jobs:
           esac >>$GITHUB_ENV
         shell: bash
       - run: |
-          mkdir -p llm/build/linux/$ARCH/stub/bin/
-          touch llm//build/linux/$ARCH/stub/bin/stub.so
+          mkdir -p llm/build/linux/$ARCH/stub/bin
+          touch llm/build/linux/$ARCH/stub/bin/ollama_llama_server
         if: ${{ startsWith(matrix.os, 'ubuntu-') }}
       - run: |
-          mkdir -p llm/build/darwin/$ARCH/stub/bin/
-          touch llm/build/darwin/$ARCH/stub/bin/stub.dylib
-          touch llm/ggml-metal.metal
+          mkdir -p llm/build/darwin/$ARCH/stub/bin
+          touch llm/build/darwin/$ARCH/stub/bin/ollama_llama_server
         if: ${{ startsWith(matrix.os, 'macos-') }}
-      - run: |
-          mkdir -p llm/build/windows/$ARCH/stub/stub/bin/
-          touch llm/build/windows/$ARCH/stub/stub/bin/stub.dll
-        if: ${{ startsWith(matrix.os, 'windows-') }}
+        shell: bash
       - run: go generate ./...
       - run: go build
       - run: go test -v ./...

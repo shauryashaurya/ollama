@@ -15,6 +15,7 @@ const (
 
 	KibiByte = Byte * 1024
 	MebiByte = KibiByte * 1024
+	GibiByte = MebiByte * 1024
 )
 
 func HumanBytes(b int64) string {
@@ -50,7 +51,7 @@ func HumanBytes(b int64) string {
 	}
 }
 
-func HumanBytes2(b int64) string {
+func HumanBytes2(b uint64) string {
 	switch {
 	case b >= MebiByte:
 		return fmt.Sprintf("%.1f MiB", float64(b)/MebiByte)

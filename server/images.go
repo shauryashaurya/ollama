@@ -29,6 +29,7 @@ import (
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/parser"
+	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
 
@@ -284,7 +285,7 @@ func realpath(mfDir, from string) string {
 	return abspath
 }
 
-func CreateModel(ctx context.Context, name, modelFileDir string, commands []parser.Command, fn func(resp api.ProgressResponse)) error {
+func CreateModel(ctx context.Context, name, modelFileDir, quantization string, commands []parser.Command, fn func(resp api.ProgressResponse)) error {
 	deleteMap := make(map[string]struct{})
 	if manifest, _, err := GetManifest(ParseModelPath(name)); err == nil {
 		for _, layer := range append(manifest.Layers, manifest.Config) {
@@ -322,7 +323,7 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 
 			pathName := realpath(modelFileDir, c.Args)
 
-			ggufName, err := convertSafetensors(name, pathName, fn)
+			ggufName, err := convertModel(name, pathName, fn)
 			if err != nil {
 				var pathErr *fs.PathError
 				switch {
@@ -337,8 +338,27 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 
 			if ggufName != "" {
 				pathName = ggufName
-				slog.Debug(fmt.Sprintf("new image layer path: %s", pathName))
 				defer os.RemoveAll(ggufName)
+
+				if quantization != "" {
+					quantization = strings.ToUpper(quantization)
+					fn(api.ProgressResponse{Status: fmt.Sprintf("quantizing %s model to %s", "F16", quantization)})
+					tempfile, err := os.CreateTemp(filepath.Dir(ggufName), quantization)
+					if err != nil {
+						return err
+					}
+					defer os.RemoveAll(tempfile.Name())
+
+					if err := llm.Quantize(ggufName, tempfile.Name(), quantization); err != nil {
+						return err
+					}
+
+					if err := tempfile.Close(); err != nil {
+						return err
+					}
+
+					pathName = tempfile.Name()
+				}
 			}
 
 			bin, err := os.Open(pathName)
@@ -614,7 +634,7 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 	return nil
 }
 
-func convertSafetensors(name, path string, fn func(resp api.ProgressResponse)) (string, error) {
+func convertModel(name, path string, fn func(resp api.ProgressResponse)) (string, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
 		return "", err
@@ -649,17 +669,22 @@ func convertSafetensors(name, path string, fn func(resp api.ProgressResponse)) (
 		rc.Close()
 	}
 
-	params, err := convert.GetParams(tempDir)
+	mf, err := convert.GetModelFormat(tempDir)
 	if err != nil {
 		return "", err
 	}
 
-	mArch, err := convert.GetModelArchFromParams(name, tempDir, params)
+	params, err := mf.GetParams(tempDir)
 	if err != nil {
 		return "", err
 	}
 
-	fn(api.ProgressResponse{Status: "processing safetensors"})
+	mArch, err := mf.GetModelArch(name, tempDir, params)
+	if err != nil {
+		return "", err
+	}
+
+	fn(api.ProgressResponse{Status: "processing tensors"})
 	if err := mArch.GetTensors(); err != nil {
 		return "", err
 	}
@@ -677,36 +702,43 @@ func convertSafetensors(name, path string, fn func(resp api.ProgressResponse)) (
 	return path, nil
 }
 
-func CopyModel(src, dest string) error {
-	srcModelPath := ParseModelPath(src)
-	srcPath, err := srcModelPath.GetManifestPath()
+func CopyModel(src, dst model.Name) error {
+	if !dst.IsFullyQualified() {
+		return model.Unqualified(dst)
+	}
+	if !src.IsFullyQualified() {
+		return model.Unqualified(src)
+	}
+
+	if src.Filepath() == dst.Filepath() {
+		return nil
+	}
+
+	manifests, err := GetManifestPath()
 	if err != nil {
 		return err
 	}
 
-	destModelPath := ParseModelPath(dest)
-	destPath, err := destModelPath.GetManifestPath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+	dstpath := filepath.Join(manifests, dst.Filepath())
+	if err := os.MkdirAll(filepath.Dir(dstpath), 0o755); err != nil {
 		return err
 	}
 
-	// copy the file
-	input, err := os.ReadFile(srcPath)
+	srcpath := filepath.Join(manifests, src.Filepath())
+	srcfile, err := os.Open(srcpath)
 	if err != nil {
-		fmt.Println("Error reading file:", err)
 		return err
 	}
+	defer srcfile.Close()
 
-	err = os.WriteFile(destPath, input, 0o644)
+	dstfile, err := os.Create(dstpath)
 	if err != nil {
-		fmt.Println("Error reading file:", err)
 		return err
 	}
+	defer dstfile.Close()
 
-	return nil
+	_, err = io.Copy(dstfile, srcfile)
+	return err
 }
 
 func deleteUnusedLayers(skipModelPath *ModelPath, deleteMap map[string]struct{}, dryRun bool) error {
@@ -1113,7 +1145,7 @@ func GetSHA256Digest(r io.Reader) (string, int64) {
 	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n
 }
 
-var errUnauthorized = fmt.Errorf("unauthorized")
+var errUnauthorized = errors.New("unauthorized")
 
 func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.URL, headers http.Header, body io.ReadSeeker, regOpts *registryOptions) (*http.Response, error) {
 	for i := 0; i < 2; i++ {
@@ -1231,7 +1263,7 @@ func parseRegistryChallenge(authStr string) registryChallenge {
 	}
 }
 
-var errDigestMismatch = fmt.Errorf("digest mismatch, file must be downloaded again")
+var errDigestMismatch = errors.New("digest mismatch, file must be downloaded again")
 
 func verifyBlob(digest string) error {
 	fp, err := GetBlobsPath(digest)

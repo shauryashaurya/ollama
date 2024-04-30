@@ -13,16 +13,6 @@ type GGML struct {
 	model
 }
 
-func (ggml *GGML) LayerSize(prefix string) (n int64) {
-	for _, t := range ggml.Tensors() {
-		if strings.HasPrefix(t.Name, prefix) {
-			n += int64(t.size())
-		}
-	}
-
-	return
-}
-
 const (
 	fileTypeF32 uint32 = iota
 	fileTypeF16
@@ -101,7 +91,7 @@ func fileType(fileType uint32) string {
 
 type model interface {
 	KV() KV
-	Tensors() []*Tensor
+	Tensors() Tensors
 }
 
 type KV map[string]any
@@ -148,15 +138,15 @@ func (kv KV) HeadCount() uint64 {
 }
 
 func (kv KV) HeadCountKV() uint64 {
-	return kv.u64(fmt.Sprintf("%s.attention.head_count_kv", kv.Architecture()))
+	if headCountKV := kv.u64(fmt.Sprintf("%s.attention.head_count_kv", kv.Architecture())); headCountKV > 0 {
+		return headCountKV
+	}
+
+	return 1
 }
 
 func (kv KV) GQA() uint64 {
-	if headCountKV := kv.HeadCountKV(); headCountKV > 0 {
-		return kv.HeadCount() / headCountKV
-	}
-
-	return 0
+	return kv.HeadCount() / kv.HeadCountKV()
 }
 
 func (kv KV) EmbeddingLength() uint64 {
@@ -165,6 +155,37 @@ func (kv KV) EmbeddingLength() uint64 {
 
 func (kv KV) ContextLength() uint64 {
 	return kv.u64(fmt.Sprintf("%s.context_length", kv.Architecture()))
+}
+
+type Tensors []*Tensor
+
+func (ts Tensors) Layers() map[string]Layer {
+	layers := make(map[string]Layer)
+	for _, t := range ts {
+		parts := strings.Split(t.Name, ".")
+		if parts[0] == "blk" {
+			// join first and second part, e.g. blk.%d
+			parts = append([]string{fmt.Sprintf("%s.%s", parts[0], parts[1])}, parts[2:]...)
+		}
+
+		if _, ok := layers[parts[0]]; !ok {
+			layers[parts[0]] = make(Layer)
+		}
+
+		layers[parts[0]][strings.Join(parts[1:], ".")] = t
+	}
+
+	return layers
+}
+
+type Layer map[string]*Tensor
+
+func (l Layer) size() (size uint64) {
+	for _, t := range l {
+		size += t.size()
+	}
+
+	return size
 }
 
 type Tensor struct {
@@ -302,4 +323,79 @@ func DecodeGGML(rs io.ReadSeeker) (*GGML, int64, error) {
 		container: c,
 		model:     model,
 	}, offset, nil
+}
+
+func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload uint64) {
+	embedding := llm.KV().EmbeddingLength()
+	heads := llm.KV().HeadCount()
+	headsKV := llm.KV().HeadCountKV()
+	vocab := uint64(len(llm.KV()["tokenizer.ggml.tokens"].([]any)))
+
+	layers := llm.Tensors().Layers()
+
+	switch llm.KV().Architecture() {
+	case "llama":
+		fullOffload = 4 * batch * (1 + 4*embedding + context*(1+heads))
+
+		partialOffload = 4 * batch * embedding
+		partialOffload += max(
+			4*batch*(1+embedding+max(context, embedding))+embedding*embedding*9/16+4*context*(batch*heads+embedding/heads*headsKV),
+			4*batch*(embedding+vocab)+embedding*vocab*105/128,
+		)
+
+		if ffnGateExpsWeight, ok := layers["blk.0"]["ffn_gate_exps.weight"]; ok {
+			// mixtral 8x22b
+			ff := uint64(llm.KV()["llama.feed_forward_length"].(uint32))
+			partialOffload = max(
+				3*ffnGateExpsWeight.size()+4*batch*(2*ff+headsKV+embedding+context+embedding/heads*headsKV),
+				4*(context*batch*heads+context*embedding/heads*headsKV+batch*1024+embedding/heads*headsKV*batch),
+			)
+		} else if ffnGateWeight, ok := layers["blk.0"]["ffn_gate.0.weight"]; ok {
+			// mixtral 8x7b
+			ffnGateWeight1 := ffnGateWeight.Shape[1]
+			fullOffload = 4 * batch * (2 + 3*embedding + context*(1+heads) + 2*headsKV + ffnGateWeight1)
+			partialOffload = max(
+				4*batch*(3+embedding/heads*headsKV+embedding+context*(1+heads)+ffnGateWeight1)+(embedding*embedding+3*embedding*headsKV*ffnGateWeight1)*9/16,
+				4*batch*(1+2*embedding+context*(1+heads))+embedding*(6*context*headsKV/heads+embedding*9/16),
+			)
+		}
+	case "gemma":
+		fullOffload = 4 * batch * (embedding + vocab)
+		partialOffload = 4*batch*(2*embedding+vocab+1) + embedding*vocab*105/128
+	case "command-r":
+		fullOffload = max(
+			4*batch*(embedding+vocab),
+			4*batch*(2+4*embedding+context*(1+heads)),
+		)
+
+		partialOffload = max(
+			4*batch*(embedding+vocab)+embedding*vocab*105/128,
+			4*batch*(1+2*embedding+context*(1+heads))+4*embedding*context+embedding*embedding*9/16,
+		)
+	case "qwen2":
+		fullOffload = max(
+			4*batch*(embedding+vocab),
+			4*batch*(1+2*embedding+context+context*heads),
+		)
+
+		partialOffload = max(
+			4*batch*(embedding+vocab)+embedding*vocab*105/128,
+			4*(batch*(1+2*embedding+context*(1+heads))+embedding*(1+context)),
+		)
+	case "phi2":
+		fullOffload = max(
+			4*batch*(embedding+vocab),
+			4*batch*(1+4*embedding+context+context*heads),
+		)
+
+		partialOffload = 4*batch*(2*embedding+vocab) + embedding*vocab*105/128
+	case "stablelm":
+		fullOffload = 4 * batch * (context*(1+heads) + 3*embedding + 2)
+		partialOffload = max(
+			4*batch*(vocab+2*embedding),
+			fullOffload,
+		)
+	}
+
+	return
 }

@@ -10,6 +10,12 @@ package gpu
 import "C"
 import (
 	"runtime"
+
+	"github.com/ollama/ollama/format"
+)
+
+const (
+	metalMinimumMemory = 512 * format.MebiByte
 )
 
 func GetGPUInfo() GpuInfoList {
@@ -18,7 +24,7 @@ func GetGPUInfo() GpuInfoList {
 		return []GpuInfo{
 			{
 				Library: "cpu",
-				Variant: GetCPUVariant(),
+				Variant: GetCPUCapability(),
 				memInfo: mem,
 			},
 		}
@@ -32,14 +38,26 @@ func GetGPUInfo() GpuInfoList {
 	// TODO is there a way to gather actual allocated video memory? (currentAllocatedSize doesn't work)
 	info.FreeMemory = info.TotalMemory
 
-	info.MinimumMemory = 0
+	info.MinimumMemory = metalMinimumMemory
 	return []GpuInfo{info}
+}
+
+func GetCPUInfo() GpuInfoList {
+	mem, _ := GetCPUMem()
+	return []GpuInfo{
+		{
+			Library: "cpu",
+			Variant: GetCPUCapability(),
+			memInfo: mem,
+		},
+	}
 }
 
 func GetCPUMem() (memInfo, error) {
 	return memInfo{
 		TotalMemory: uint64(C.getPhysicalMemory()),
-		FreeMemory:  0,
+		FreeMemory:  uint64(C.getFreeMemory()),
+		// FreeSwap omitted as Darwin uses dynamic paging
 	}, nil
 }
 

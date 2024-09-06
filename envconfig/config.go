@@ -30,9 +30,7 @@ func Host() *url.URL {
 		defaultPort = "443"
 	}
 
-	// trim trailing slashes
-	hostport = strings.TrimRight(hostport, "/")
-
+	hostport, path, _ := strings.Cut(hostport, "/")
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host, port = "127.0.0.1", defaultPort
@@ -45,15 +43,13 @@ func Host() *url.URL {
 
 	if n, err := strconv.ParseInt(port, 10, 32); err != nil || n > 65535 || n < 0 {
 		slog.Warn("invalid port, using default", "port", port, "default", defaultPort)
-		return &url.URL{
-			Scheme: scheme,
-			Host:   net.JoinHostPort(host, defaultPort),
-		}
+		port = defaultPort
 	}
 
 	return &url.URL{
 		Scheme: scheme,
 		Host:   net.JoinHostPort(host, port),
+		Path:   path,
 	}
 }
 
@@ -116,6 +112,26 @@ func KeepAlive() (keepAlive time.Duration) {
 	return keepAlive
 }
 
+// LoadTimeout returns the duration for stall detection during model loads. LoadTimeout can be configured via the OLLAMA_LOAD_TIMEOUT environment variable.
+// Zero or Negative values are treated as infinite.
+// Default is 5 minutes.
+func LoadTimeout() (loadTimeout time.Duration) {
+	loadTimeout = 5 * time.Minute
+	if s := Var("OLLAMA_LOAD_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil {
+			loadTimeout = d
+		} else if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			loadTimeout = time.Duration(n) * time.Second
+		}
+	}
+
+	if loadTimeout <= 0 {
+		return time.Duration(math.MaxInt64)
+	}
+
+	return loadTimeout
+}
+
 func Bool(k string) func() bool {
 	return func() bool {
 		if s := Var(k); s != "" {
@@ -174,7 +190,7 @@ func RunnersDir() (p string) {
 
 	defer func() {
 		if p == "" {
-			slog.Error("unable to locate llm runner directory. Set OLLAMA_RUNNERS_DIR to the location of 'ollama_runners'")
+			slog.Error("unable to locate llm runner directory. Set OLLAMA_RUNNERS_DIR to the location of 'ollama/runners'")
 		}
 	}()
 
@@ -190,17 +206,17 @@ func RunnersDir() (p string) {
 	}
 
 	var paths []string
-	for _, root := range []string{filepath.Dir(exe), cwd} {
+	for _, root := range []string{filepath.Dir(exe), filepath.Join(filepath.Dir(exe), LibRelativeToExe()), cwd} {
 		paths = append(paths,
 			root,
-			filepath.Join(root, "windows-"+runtime.GOARCH),
-			filepath.Join(root, "dist", "windows-"+runtime.GOARCH),
+			filepath.Join(root, runtime.GOOS+"-"+runtime.GOARCH),
+			filepath.Join(root, "dist", runtime.GOOS+"-"+runtime.GOARCH),
 		)
 	}
 
 	// Try a few variations to improve developer experience when building from source in the local tree
 	for _, path := range paths {
-		candidate := filepath.Join(path, "ollama_runners")
+		candidate := filepath.Join(path, "lib", "ollama", "runners")
 		if _, err := os.Stat(candidate); err == nil {
 			p = candidate
 			break
@@ -235,6 +251,23 @@ var (
 	MaxVRAM = Uint("OLLAMA_MAX_VRAM", 0)
 )
 
+func Uint64(key string, defaultValue uint64) func() uint64 {
+	return func() uint64 {
+		if s := Var(key); s != "" {
+			if n, err := strconv.ParseUint(s, 10, 64); err != nil {
+				slog.Warn("invalid environment variable, using default", "key", key, "value", s, "default", defaultValue)
+			} else {
+				return n
+			}
+		}
+
+		return defaultValue
+	}
+}
+
+// Set aside VRAM per GPU
+var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
+
 type EnvVar struct {
 	Name        string
 	Value       any
@@ -245,9 +278,11 @@ func AsMap() map[string]EnvVar {
 	ret := map[string]EnvVar{
 		"OLLAMA_DEBUG":             {"OLLAMA_DEBUG", Debug(), "Show additional debug information (e.g. OLLAMA_DEBUG=1)"},
 		"OLLAMA_FLASH_ATTENTION":   {"OLLAMA_FLASH_ATTENTION", FlashAttention(), "Enabled flash attention"},
+		"OLLAMA_GPU_OVERHEAD":      {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_HOST":              {"OLLAMA_HOST", Host(), "IP Address for the ollama server (default 127.0.0.1:11434)"},
 		"OLLAMA_KEEP_ALIVE":        {"OLLAMA_KEEP_ALIVE", KeepAlive(), "The duration that models stay loaded in memory (default \"5m\")"},
 		"OLLAMA_LLM_LIBRARY":       {"OLLAMA_LLM_LIBRARY", LLMLibrary(), "Set LLM library to bypass autodetection"},
+		"OLLAMA_LOAD_TIMEOUT":      {"OLLAMA_LOAD_TIMEOUT", LoadTimeout(), "How long to allow model loads to stall before giving up (default \"5m\")"},
 		"OLLAMA_MAX_LOADED_MODELS": {"OLLAMA_MAX_LOADED_MODELS", MaxRunners(), "Maximum number of loaded models per GPU"},
 		"OLLAMA_MAX_QUEUE":         {"OLLAMA_MAX_QUEUE", MaxQueue(), "Maximum number of queued requests"},
 		"OLLAMA_MODELS":            {"OLLAMA_MODELS", Models(), "The path to the models directory"},
@@ -281,4 +316,13 @@ func Values() map[string]string {
 // Var returns an environment variable stripped of leading and trailing quotes or spaces
 func Var(key string) string {
 	return strings.Trim(strings.TrimSpace(os.Getenv(key)), "\"'")
+}
+
+// On windows, we keep the binary at the top directory, but
+// other platforms use a "bin" directory, so this returns ".."
+func LibRelativeToExe() string {
+	if runtime.GOOS == "windows" {
+		return "."
+	}
+	return ".."
 }
